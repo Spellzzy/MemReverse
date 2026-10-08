@@ -23,20 +23,37 @@ internal sealed class MainForm : Form
     readonly NotifyIcon _tray;
     readonly NumericUpDown _cushion;
     readonly NumericUpDown _threshold;
+    readonly Panel _statusCard;
+    readonly Panel _historyCard;
+    readonly Panel _settingsCard;
+    readonly Panel _optionsCard;
     readonly Panel _accent;
     readonly Label _status;
     readonly Label _hero;
     readonly Label _available;
     readonly Label _detail;
+    readonly Label _history;
+    readonly Label _hint;
     readonly Button _releaseButton;
     readonly Button _acquireButton;
+    readonly Button _launchButton;
+    readonly CheckBox _startupCheck;
+    readonly CheckBox _hardLimitCheck;
+    readonly CheckBox _pauseCheck;
+    readonly Label _guardNote;
+    readonly ToolStripMenuItem _resumeItem;
+    readonly ToolStripMenuItem _endItem;
+    readonly LowMemoryWatch _lowMemory = new();
     readonly CushionController _controller;
+    readonly bool _startInTray;
+    bool _allowShow;
     bool _loading = true;
     bool _exiting;
     bool _hideTipShown;
 
-    public MainForm()
+    public MainForm(bool startInTray = false)
     {
+        _startInTray = startInTray;
         Text = "内存预留";
         Font = new Font("Microsoft YaHei UI", 9F);
         FormBorderStyle = FormBorderStyle.FixedSingle;
@@ -45,6 +62,8 @@ internal sealed class MainForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         BackColor = PageColor;
         Icon = CreateAppIcon();
+        if (startInTray)
+            ShowInTaskbar = false;
 
         int totalMb = (int)(NativeMemory.GetTotalPhysical() / (1024 * 1024));
         int half = Math.Max(0, totalMb / 2);
@@ -54,17 +73,28 @@ internal sealed class MainForm : Form
         int cushionValue = Snap(settings.CushionMb, 256, cushionMax);
         int thresholdValue = Snap(settings.ReleaseThresholdMb, 512, thresholdMax);
         _controller = new CushionController(cushionValue, thresholdValue);
+        if (StartupRegistration.IsEnabled())
+        {
+            try
+            {
+                StartupRegistration.SetEnabled(true);
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        if (settings.HardLimit && !_controller.SetHardLimit(true, out _))
+            settings.HardLimit = false;
+        _controller.SetPauseOnThreshold(settings.PauseOnThreshold);
 
         _cushion = CreateNumber(256, cushionMax, cushionValue);
         _threshold = CreateNumber(512, thresholdMax, thresholdValue);
         _cushion.AccessibleName = "预留";
         _threshold.AccessibleName = "释放阈值";
 
-        const int pad = 16;
-        const int width = 384;
-        int y = pad;
-
-        var statusCard = CreateCard(pad, y, width, 124);
+        const int width = 460;
+        _statusCard = CreateCard(0, 0, width, 116);
         _accent = new Panel
         {
             Dock = DockStyle.Left,
@@ -74,51 +104,78 @@ internal sealed class MainForm : Form
         _status = CreateTextLabel(TextColor, 9F, FontStyle.Regular);
         _hero = CreateTextLabel(HoldingColor, 20F, FontStyle.Bold);
         _available = CreateTextLabel(MutedColor, 9F, FontStyle.Regular);
-        _status.Bounds = new Rectangle(20, 16, width - 36, 22);
-        _hero.Bounds = new Rectangle(18, 40, width - 36, 42);
-        _available.Bounds = new Rectangle(20, 86, width - 36, 24);
-        statusCard.Controls.Add(_accent);
-        statusCard.Controls.Add(_status);
-        statusCard.Controls.Add(_hero);
-        statusCard.Controls.Add(_available);
-        Controls.Add(statusCard);
-        y += statusCard.Height + 8;
+        _status.Bounds = new Rectangle(20, 12, width - 36, 20);
+        _hero.Bounds = new Rectangle(18, 32, width - 36, 40);
+        _available.Bounds = new Rectangle(20, 76, width - 36, 24);
+        _statusCard.Controls.Add(_accent);
+        _statusCard.Controls.Add(_status);
+        _statusCard.Controls.Add(_hero);
+        _statusCard.Controls.Add(_available);
+        Controls.Add(_statusCard);
 
         _detail = CreateTextLabel(MutedColor, 9F, FontStyle.Regular);
         _detail.BackColor = PageColor;
-        _detail.Bounds = new Rectangle(pad, y, width, 40);
+        _detail.AutoEllipsis = true;
         Controls.Add(_detail);
-        y += _detail.Height + 8;
 
-        var settingsCard = CreateCard(pad, y, width, 104);
-        AddSettingRow(settingsCard, 16, "预留", _cushion);
-        AddSettingRow(settingsCard, 58, "释放阈值", _threshold);
-        Controls.Add(settingsCard);
-        y += settingsCard.Height + 12;
+        _historyCard = CreateCard(0, 0, width, 110);
+        var historyTitle = CreateTextLabel(TextColor, 9F, FontStyle.Regular);
+        historyTitle.Text = "最近放开";
+        historyTitle.Bounds = new Rectangle(16, 6, width - 32, 20);
+        _history = CreateTextLabel(MutedColor, 9F, FontStyle.Regular);
+        _history.TextAlign = ContentAlignment.TopLeft;
+        _history.Bounds = new Rectangle(16, 28, width - 32, 74);
+        _historyCard.Controls.Add(historyTitle);
+        _historyCard.Controls.Add(_history);
+        Controls.Add(_historyCard);
 
-        var hint = CreateTextLabel(MutedColor, 9F, FontStyle.Regular);
-        hint.BackColor = PageColor;
-        hint.Bounds = new Rectangle(pad, y, width, 40);
-        hint.Text = $"释放后需连续 {CushionController.RecoverHoldSeconds} 秒高于「阈值 + 预留 + {CushionController.MarginMb} MB」，{Environment.NewLine}才会重新占用。";
-        Controls.Add(hint);
-        y += hint.Height + 12;
+        _settingsCard = CreateCard(0, 0, width, 96);
+        AddSettingRow(_settingsCard, 12, "预留", _cushion);
+        AddSettingRow(_settingsCard, 52, "释放阈值", _threshold);
+        Controls.Add(_settingsCard);
 
-        int buttonWidth = (width - 8) / 2;
+        _startupCheck = CreateCheck("开机时启动");
+        _hardLimitCheck = CreateCheck("编译硬上限");
+        _pauseCheck = CreateCheck("到线时暂停编译");
+        _launchButton = CreateButton("启动编译", primary: false);
+        _guardNote = CreateTextLabel(MutedColor, 9F, FontStyle.Regular);
+        _guardNote.BackColor = PageColor;
+        _guardNote.AutoEllipsis = true;
+        _optionsCard = CreateCard(0, 0, width, 140);
+        _startupCheck.Bounds = new Rectangle(16, 8, width - 32, 24);
+        _hardLimitCheck.Bounds = new Rectangle(16, 34, width - 32, 24);
+        _pauseCheck.Bounds = new Rectangle(16, 60, width - 32, 24);
+        _launchButton.Bounds = new Rectangle(16, 92, width - 32, 32);
+        _optionsCard.Controls.Add(_startupCheck);
+        _optionsCard.Controls.Add(_hardLimitCheck);
+        _optionsCard.Controls.Add(_pauseCheck);
+        _optionsCard.Controls.Add(_launchButton);
+        Controls.Add(_optionsCard);
+        Controls.Add(_guardNote);
+
+        _hint = CreateTextLabel(MutedColor, 9F, FontStyle.Regular);
+        _hint.BackColor = PageColor;
+        _hint.AutoEllipsis = true;
+        _hint.Text = $"释放后需连续 {CushionController.RecoverHoldSeconds} 秒高于「阈值 + 预留 + {CushionController.MarginMb} MB」，才会重新占用。";
+        Controls.Add(_hint);
+
         _releaseButton = CreateButton("立即释放", primary: false);
         _acquireButton = CreateButton("重新预留", primary: true);
-        _releaseButton.Bounds = new Rectangle(pad, y, buttonWidth, 36);
-        _acquireButton.Bounds = new Rectangle(pad + buttonWidth + 8, y, buttonWidth, 36);
         _releaseButton.Click += (_, _) => _controller.ReleaseNow();
         _acquireButton.Click += (_, _) => _controller.AcquireNow();
         Controls.Add(_releaseButton);
         Controls.Add(_acquireButton);
-        y += _releaseButton.Height + pad;
-
-        ClientSize = new Size(pad * 2 + width, y);
 
         _controller.StateChanged += (_, _) => ApplyState();
         _controller.ReservationReleased += (_, _) =>
             ShowBalloon("已释放", $"已释放预留内存。剩余 {_controller.AvailableMb} MB", ToolTipIcon.Warning);
+        _controller.SliceReleased += (_, _) =>
+            ShowBalloon("已放开一部分", $"已放开 256 MB，仍预留 {_controller.HeldMb} MB。剩余 {_controller.AvailableMb} MB", ToolTipIcon.Info);
+        _controller.ProcessPaused += (_, name) =>
+        {
+            ShowBalloon("已暂停", $"{name} 已暂停，可在托盘选择继续或结束。", ToolTipIcon.Warning);
+            UpdatePauseMenu();
+        };
         _controller.ReservationFailed += (_, message) =>
             ShowBalloon("占用失败", $"{message} 剩余 {_controller.AvailableMb} MB", ToolTipIcon.Error);
 
@@ -130,6 +187,12 @@ internal sealed class MainForm : Form
         };
         var menu = new ContextMenuStrip();
         menu.Items.Add("显示", null, (_, _) => ShowWindow());
+        _resumeItem = new ToolStripMenuItem("继续") { Enabled = false };
+        _endItem = new ToolStripMenuItem("结束") { Enabled = false };
+        _resumeItem.Click += (_, _) => _controller.ResumePaused();
+        _endItem.Click += (_, _) => _controller.KillPaused();
+        menu.Items.Add(_resumeItem);
+        menu.Items.Add(_endItem);
         menu.Items.Add("退出", null, (_, _) => ExitApp());
         _tray.ContextMenuStrip = menu;
         _tray.DoubleClick += (_, _) => ShowWindow();
@@ -139,20 +202,77 @@ internal sealed class MainForm : Form
 
         _cushion.ValueChanged += (_, _) => OnCushionChanged();
         _threshold.ValueChanged += (_, _) => OnThresholdChanged();
+        _startupCheck.Checked = StartupRegistration.IsEnabled();
+        _hardLimitCheck.Checked = _controller.HardLimit;
+        _pauseCheck.Checked = settings.PauseOnThreshold;
+        _startupCheck.CheckedChanged += (_, _) => OnStartupChanged();
+        _hardLimitCheck.CheckedChanged += (_, _) => OnHardLimitChanged();
+        _pauseCheck.CheckedChanged += (_, _) => OnPauseChanged();
+        _launchButton.Click += (_, _) => LaunchCompile();
         FormClosing += OnFormClosing;
         _loading = false;
         ApplyState();
     }
 
+    bool _creatingHandle;
+    bool _started;
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        StartWorking();
+    }
+
     protected override void OnLoad(EventArgs e)
     {
         base.OnLoad(e);
-        var context = SynchronizationContext.Current;
-        if (context != null)
-            _controller.UseUiContext(context);
+        if (SynchronizationContext.Current != null)
+            _controller.UseUiContext(SynchronizationContext.Current);
+    }
+
+    void StartWorking()
+    {
+        if (_started || _exiting)
+            return;
+
+        _started = true;
+        if (SynchronizationContext.Current != null)
+            _controller.UseUiContext(SynchronizationContext.Current);
 
         _timer.Start();
+        _lowMemory.Signaled += () =>
+        {
+            if (!IsHandleCreated || IsDisposed || _exiting)
+                return;
+
+            try
+            {
+                BeginInvoke(() => _controller.Tick());
+            }
+            catch (InvalidOperationException)
+            {
+            }
+        };
+        _lowMemory.Start();
         _controller.Tick();
+    }
+
+    protected override void SetVisibleCore(bool value)
+    {
+        if (_startInTray && !_allowShow)
+        {
+            if (!IsHandleCreated && !_creatingHandle)
+            {
+                _creatingHandle = true;
+                CreateHandle();
+                _creatingHandle = false;
+            }
+
+            value = false;
+            ShowInTaskbar = false;
+        }
+
+        base.SetVisibleCore(value);
     }
 
     protected override void OnResize(EventArgs e)
@@ -165,6 +285,7 @@ internal sealed class MainForm : Form
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         _timer.Stop();
+        _lowMemory.Dispose();
         _tray.Visible = false;
         _tray.Dispose();
         base.OnFormClosed(e);
@@ -230,16 +351,152 @@ internal sealed class MainForm : Form
         }
 
         _detail.Text = _controller.DetailText;
+        _history.Text = FormatReleases();
+        _guardNote.Text = _controller.GuardNote;
+        Arrange();
         bool acquiring = _controller.Phase == CushionPhase.Acquiring;
         _cushion.Enabled = !acquiring;
         _threshold.Enabled = !acquiring;
         _releaseButton.Enabled = _controller.Phase == CushionPhase.Holding;
         _acquireButton.Enabled = !acquiring && _controller.Phase != CushionPhase.Holding;
+        _launchButton.Enabled = _hardLimitCheck.Checked;
+        UpdatePauseMenu();
         _tray.Text = LimitTip($"{_controller.StatusText}，剩余 {_controller.AvailableMb} MB");
+    }
+
+    void Arrange()
+    {
+        const int pad = 14;
+        const int gap = 6;
+        int width = _statusCard.Width;
+        int y = pad;
+
+        void Place(Control control, int height, int after = gap)
+        {
+            control.Visible = height > 0;
+            if (height <= 0)
+                return;
+
+            control.SetBounds(pad, y, width, height);
+            y += height + after;
+        }
+
+        Place(_statusCard, _statusCard.Height);
+        Place(_detail, string.IsNullOrEmpty(_detail.Text) ? 0 : 22, 4);
+        Place(_historyCard, _historyCard.Height);
+        Place(_settingsCard, _settingsCard.Height);
+        Place(_optionsCard, _optionsCard.Height);
+        Place(_guardNote, string.IsNullOrEmpty(_guardNote.Text) ? 0 : 22, 4);
+        Place(_hint, 22, 8);
+
+        int buttonWidth = (width - 8) / 2;
+        _releaseButton.SetBounds(pad, y, buttonWidth, 34);
+        _acquireButton.SetBounds(pad + buttonWidth + 8, y, buttonWidth, 34);
+        y += _releaseButton.Height + pad;
+        ClientSize = new Size(pad * 2 + width, y);
+    }
+
+    string FormatReleases()
+    {
+        IReadOnlyList<ReleaseNote> notes = _controller.RecentReleases;
+        if (notes.Count == 0)
+            return "还没有放开记录";
+
+        var lines = new string[notes.Count];
+        for (int i = 0; i < notes.Count; i++)
+        {
+            ReleaseNote note = notes[i];
+            lines[i] = $"{note.Time:HH:mm:ss}  {note.ProcessName}  剩余 {note.AvailableMb:N0} MB";
+        }
+
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    void UpdatePauseMenu()
+    {
+        bool paused = _controller.HasPausedProcess;
+        _resumeItem.Enabled = paused;
+        _endItem.Enabled = paused;
+    }
+
+    void OnStartupChanged()
+    {
+        if (_loading)
+            return;
+
+        try
+        {
+            StartupRegistration.SetEnabled(_startupCheck.Checked);
+        }
+        catch (Exception ex)
+        {
+            _loading = true;
+            _startupCheck.Checked = StartupRegistration.IsEnabled();
+            _loading = false;
+            _guardNote.Text = ex.Message;
+        }
+
+        SaveSettings();
+    }
+
+    void OnHardLimitChanged()
+    {
+        if (_loading)
+            return;
+
+        if (!_controller.SetHardLimit(_hardLimitCheck.Checked, out string? error))
+        {
+            _loading = true;
+            _hardLimitCheck.Checked = false;
+            _loading = false;
+            _guardNote.Text = error ?? "无法打开硬上限。";
+        }
+
+        SaveSettings();
+    }
+
+    void OnPauseChanged()
+    {
+        if (_loading)
+            return;
+
+        _controller.SetPauseOnThreshold(_pauseCheck.Checked);
+        SaveSettings();
+        UpdatePauseMenu();
+    }
+
+    void LaunchCompile()
+    {
+        using var dialog = new Form
+        {
+            Text = "启动编译",
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            StartPosition = FormStartPosition.CenterParent,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ClientSize = new Size(420, 124),
+            Font = Font
+        };
+        var label = new Label { Text = "命令行", AutoSize = true, Location = new Point(16, 16) };
+        var box = new TextBox { Location = new Point(16, 40), Width = 388 };
+        var ok = new Button { Text = "启动", DialogResult = DialogResult.OK, Location = new Point(236, 80), Width = 80 };
+        var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Location = new Point(324, 80), Width = 80 };
+        dialog.Controls.Add(label);
+        dialog.Controls.Add(box);
+        dialog.Controls.Add(ok);
+        dialog.Controls.Add(cancel);
+        dialog.AcceptButton = ok;
+        dialog.CancelButton = cancel;
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+            return;
+
+        if (!_controller.TryLaunchCompile(box.Text, out string? error))
+            MessageBox.Show(this, error, "启动编译", MessageBoxButtons.OK, MessageBoxIcon.Warning);
     }
 
     void ShowWindow()
     {
+        _allowShow = true;
         ShowInTaskbar = true;
         Show();
         WindowState = FormWindowState.Normal;
@@ -334,6 +591,18 @@ internal sealed class MainForm : Form
             ForeColor = color,
             Font = new Font("Microsoft YaHei UI", size, style),
             TextAlign = ContentAlignment.MiddleLeft
+        };
+    }
+
+    static CheckBox CreateCheck(string text)
+    {
+        return new CheckBox
+        {
+            Text = text,
+            AutoSize = false,
+            BackColor = Color.White,
+            ForeColor = TextColor,
+            Font = new Font("Microsoft YaHei UI", 9F)
         };
     }
 
@@ -492,7 +761,10 @@ internal sealed class MainForm : Form
             var settings = new AppSettings
             {
                 CushionMb = _controller.CushionMb,
-                ReleaseThresholdMb = _controller.ThresholdMb
+                ReleaseThresholdMb = _controller.ThresholdMb,
+                LaunchAtStartup = _startupCheck.Checked,
+                HardLimit = _hardLimitCheck.Checked,
+                PauseOnThreshold = _pauseCheck.Checked
             };
             File.WriteAllText(SettingsPath, JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true }));
         }
@@ -516,4 +788,7 @@ sealed class AppSettings
 {
     public int CushionMb { get; set; } = 2048;
     public int ReleaseThresholdMb { get; set; } = 2048;
+    public bool LaunchAtStartup { get; set; }
+    public bool HardLimit { get; set; }
+    public bool PauseOnThreshold { get; set; }
 }

@@ -13,7 +13,11 @@ internal sealed class CushionController
     public const int RecoverHoldSeconds = 30;
     const long Megabyte = 1024 * 1024;
 
+    public const int RecentReleaseLimit = 4;
+
     readonly CancellationTokenSource _cancellation = new();
+    readonly CompileGuard _guard = new();
+    readonly List<ReleaseNote> _recentReleases = new();
     SynchronizationContext? _ui;
     Task? _inflight;
     int _operationId;
@@ -21,10 +25,16 @@ internal sealed class CushionController
     int _thresholdMb;
     long _heldBytes;
     ulong _availableBytes;
+    long _lastSliceAt;
     bool _shuttingDown;
     bool _recovery;
     bool _suppressAuto;
+    bool _suspendArmed = true;
+    bool _announcedSlice;
     int _recoverSeconds;
+
+    public bool PauseOnThreshold { get; private set; }
+    public bool HardLimit { get; private set; }
 
     public CushionController(int cushionMb, int thresholdMb)
     {
@@ -40,9 +50,14 @@ internal sealed class CushionController
     public int ThresholdMb => _thresholdMb;
     public long AvailableMb => (long)(_availableBytes / (ulong)Megabyte);
     public long HeldMb => _heldBytes / Megabyte;
+    public bool HasPausedProcess => _guard.HasSuspended;
+    public string GuardNote => _guard.LastError ?? "";
+    public IReadOnlyList<ReleaseNote> RecentReleases => _recentReleases;
 
     public event EventHandler? StateChanged;
     public event EventHandler? ReservationReleased;
+    public event EventHandler? SliceReleased;
+    public event EventHandler<string>? ProcessPaused;
     public event EventHandler<string>? ReservationFailed;
 
     public void UseUiContext(SynchronizationContext context)
@@ -56,6 +71,11 @@ internal sealed class CushionController
             return;
 
         _availableBytes = NativeMemory.GetAvailablePhysical();
+        _guard.PollSuspended();
+        if (HardLimit)
+            _guard.AttachNewProcesses();
+        if (_availableBytes >= (ulong)_thresholdMb * (ulong)Megabyte)
+            _suspendArmed = true;
 
         if (Phase == CushionPhase.Acquiring)
         {
@@ -67,12 +87,14 @@ internal sealed class CushionController
         {
             if (_availableBytes < (ulong)_thresholdMb * (ulong)Megabyte)
             {
-                ReleaseHolding(recovery: true);
-                ReservationReleased?.Invoke(this, EventArgs.Empty);
+                TryPause();
+                ReleaseOneSlice(immediate: false);
                 return;
             }
 
+            _announcedSlice = false;
             StatusText = $"已预留 {HeldMb} MB";
+            DetailText = "";
             Notify();
             return;
         }
@@ -171,11 +193,67 @@ internal sealed class CushionController
 
         if (Phase == CushionPhase.Holding && _availableBytes < (ulong)_thresholdMb * (ulong)Megabyte)
         {
-            ReleaseHolding(recovery: true);
-            ReservationReleased?.Invoke(this, EventArgs.Empty);
+            TryPause();
+            ReleaseOneSlice(immediate: true);
             return;
         }
 
+        if (HardLimit)
+            _guard.UpdateLimit(JobLimitBytes());
+
+        Notify();
+    }
+
+    public bool SetHardLimit(bool enabled, out string? error)
+    {
+        error = null;
+        if (!enabled)
+        {
+            _guard.Disable();
+            HardLimit = false;
+            Notify();
+            return true;
+        }
+
+        if (!_guard.Enable(JobLimitBytes(), out error))
+        {
+            HardLimit = false;
+            Notify();
+            return false;
+        }
+
+        HardLimit = true;
+        _guard.AttachNewProcesses();
+        Notify();
+        return true;
+    }
+
+    public void SetPauseOnThreshold(bool enabled)
+    {
+        PauseOnThreshold = enabled;
+        if (!enabled)
+        {
+            _suspendArmed = true;
+            _guard.ResumeSuspended();
+        }
+
+        Notify();
+    }
+
+    public bool TryLaunchCompile(string commandLine, out string? error)
+    {
+        return _guard.TryLaunch(commandLine, out error);
+    }
+
+    public void ResumePaused()
+    {
+        _guard.ResumeSuspended();
+        Notify();
+    }
+
+    public void KillPaused()
+    {
+        _guard.KillSuspended();
         Notify();
     }
 
@@ -196,6 +274,7 @@ internal sealed class CushionController
         }
 
         NativeMemory.Release();
+        _guard.Dispose();
     }
 
     void TryStartAcquire()
@@ -294,10 +373,60 @@ internal sealed class CushionController
     {
         long held = _heldBytes;
         NativeMemory.Release();
-        ulong observed = NativeMemory.GetAvailablePhysical();
-        ulong estimated = _availableBytes + (ulong)Math.Max(held, 0);
-        _availableBytes = Math.Max(observed, estimated);
+        RememberAvailable(held);
         _heldBytes = 0;
+        _announcedSlice = false;
+        EnterRecovery(recovery);
+    }
+
+    void ReleaseOneSlice(bool immediate)
+    {
+        long now = Environment.TickCount64;
+        if (!immediate && now - _lastSliceAt < 900)
+        {
+            Notify();
+            return;
+        }
+
+        long released = NativeMemory.ReleaseSlice(NativeMemory.SliceBytes);
+        _lastSliceAt = now;
+        if (released > 0)
+            NotePressureRelease();
+        _heldBytes = NativeMemory.HeldBytes;
+        RememberAvailable(released);
+        if (_heldBytes <= 0)
+        {
+            _announcedSlice = false;
+            EnterRecovery(recovery: true);
+            ReservationReleased?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+
+        StatusText = $"已预留 {HeldMb} MB";
+        DetailText = $"已放开 {Math.Max(released, 0) / Megabyte} MB";
+        Notify();
+        if (released > 0 && !_announcedSlice)
+        {
+            _announcedSlice = true;
+            SliceReleased?.Invoke(this, EventArgs.Empty);
+        }
+    }
+
+    void TryPause()
+    {
+        if (!PauseOnThreshold || !_suspendArmed || _guard.HasSuspended)
+            return;
+
+        if (_guard.TrySuspendHeaviest(out string? name, out _))
+        {
+            _suspendArmed = false;
+            if (!string.IsNullOrEmpty(name))
+                ProcessPaused?.Invoke(this, name);
+        }
+    }
+
+    void EnterRecovery(bool recovery)
+    {
         Phase = CushionPhase.Waiting;
         _recovery = recovery;
         _suppressAuto = recovery;
@@ -305,6 +434,28 @@ internal sealed class CushionController
         StatusText = recovery ? "已释放" : "等待";
         DetailText = recovery ? RecoverDetail() : "";
         Notify();
+    }
+
+    void NotePressureRelease()
+    {
+        _recentReleases.Insert(0, new ReleaseNote(DateTime.Now, CompileGuard.HeaviestName(), AvailableMb));
+        if (_recentReleases.Count > RecentReleaseLimit)
+            _recentReleases.RemoveAt(_recentReleases.Count - 1);
+    }
+
+    void RememberAvailable(long releasedBytes)
+    {
+        ulong observed = NativeMemory.GetAvailablePhysical();
+        ulong estimated = _availableBytes + (ulong)Math.Max(releasedBytes, 0);
+        _availableBytes = Math.Max(observed, estimated);
+    }
+
+    long JobLimitBytes()
+    {
+        long total = (long)NativeMemory.GetTotalPhysical();
+        long keep = (long)_thresholdMb * Megabyte;
+        long limit = total - keep;
+        return limit < NativeMemory.SliceBytes ? NativeMemory.SliceBytes : limit;
     }
 
     string RecoverDetail()
@@ -327,3 +478,5 @@ internal sealed class CushionController
         StateChanged?.Invoke(this, EventArgs.Empty);
     }
 }
+
+internal readonly record struct ReleaseNote(DateTime Time, string ProcessName, long AvailableMb);

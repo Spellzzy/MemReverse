@@ -5,7 +5,7 @@ internal static class Program
     const string MutexName = @"Local\ProTools.MemReserve";
 
     [STAThread]
-    static void Main()
+    static void Main(string[] args)
     {
         if (!Environment.Is64BitProcess)
         {
@@ -27,10 +27,11 @@ internal static class Program
         if (!owned)
             return;
 
+        bool startInTray = args.Any(argument => string.Equals(argument, "--tray", StringComparison.OrdinalIgnoreCase));
         try
         {
             ApplicationConfiguration.Initialize();
-            Application.Run(new MainForm());
+            Application.Run(new MainForm(startInTray));
         }
         finally
         {

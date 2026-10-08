@@ -39,6 +39,7 @@ internal static class NativeMemory
     const uint PageReadWrite = 0x04;
     const uint QuotaLimitsHardWsMinEnable = 0x00000001;
     const long Megabyte = 1024 * 1024;
+    public const long SliceBytes = 256 * Megabyte;
     const long LockChunk = 64 * Megabyte;
     const long OverheadBytes = 64 * Megabyte;
     const long MaxHeadroomBytes = 256 * Megabyte;
@@ -46,10 +47,18 @@ internal static class NativeMemory
     const long IdleMaxWorkingSet = 256 * Megabyte;
 
     static readonly object Gate = new();
-    static IntPtr _address;
-    static long _locked;
+    static readonly List<Chunk> Chunks = new();
     static int _shuttingDown;
     static uint _pageSize;
+
+    public static long HeldBytes
+    {
+        get
+        {
+            lock (Gate)
+                return Chunks.Sum(chunk => chunk.Size);
+        }
+    }
 
     public static ulong GetAvailablePhysical()
     {
@@ -75,74 +84,73 @@ internal static class NativeMemory
             if (IsShuttingDown || cancellationToken.IsCancellationRequested)
                 return AcquireAttempt.Cancelled();
 
-            if (_address != IntPtr.Zero)
+            if (Chunks.Count > 0)
                 return AcquireAttempt.Failed("已经占用了一块预留内存。");
 
             uint pageSize = PageSize();
             long size = AlignUp(bytes, pageSize);
-            long minWorkingSet = size + OverheadBytes;
-            long maxWorkingSet = minWorkingSet + MaxHeadroomBytes;
-
-            // 先抬高最小工作集，VirtualLock 的配额大约等于这个下限。
-            if (!SetProcessWorkingSetSizeEx(
-                    GetCurrentProcess(),
-                    (UIntPtr)minWorkingSet,
-                    (UIntPtr)maxWorkingSet,
-                    QuotaLimitsHardWsMinEnable))
-            {
+            if (!ApplyWorkingSet(size))
                 return AcquireAttempt.Failed(Win32Message("设置工作集失败"));
-            }
 
-            IntPtr address = VirtualAlloc(IntPtr.Zero, (UIntPtr)size, MemCommit | MemReserve, PageReadWrite);
-            if (address == IntPtr.Zero)
-            {
-                RestoreWorkingSet();
-                return AcquireAttempt.Failed(Win32Message("分配内存失败"));
-            }
-
-            long locked = 0;
+            var fresh = new List<Chunk>();
             try
             {
-                TouchPages(address, size, pageSize, cancellationToken);
-
-                while (locked < size)
+                long acquired = 0;
+                while (acquired < size)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     if (IsShuttingDown)
                         throw new OperationCanceledException();
 
-                    long chunk = Math.Min(LockChunk, size - locked);
-                    IntPtr chunkAddress = new(address.ToInt64() + locked);
-                    if (!VirtualLock(chunkAddress, (UIntPtr)chunk))
-                    {
-                        int error = Marshal.GetLastWin32Error();
-                        FreeRegion(address, locked);
-                        RestoreWorkingSet();
-                        return AcquireAttempt.Failed(Win32Message("锁定内存失败", error));
-                    }
-
-                    locked += chunk;
+                    long slice = Math.Min(SliceBytes, size - acquired);
+                    Chunk chunk = LockSlice(slice, pageSize, cancellationToken);
+                    fresh.Add(chunk);
+                    acquired += chunk.Size;
                 }
 
-                if (IsShuttingDown || cancellationToken.IsCancellationRequested)
-                    throw new OperationCanceledException();
-
-                _address = address;
-                _locked = locked;
-                return AcquireAttempt.Success(size);
+                Chunks.AddRange(fresh);
+                return AcquireAttempt.Success(Chunks.Sum(chunk => chunk.Size));
             }
             catch (OperationCanceledException)
             {
-                FreeRegion(address, locked);
+                FreeChunks(fresh);
                 RestoreWorkingSet();
                 return AcquireAttempt.Cancelled();
             }
-            catch (Exception ex)
+            catch (LockFailedException ex)
             {
-                FreeRegion(address, locked);
+                FreeChunks(fresh);
                 RestoreWorkingSet();
                 return AcquireAttempt.Failed(ex.Message);
             }
+            catch (Exception ex)
+            {
+                FreeChunks(fresh);
+                RestoreWorkingSet();
+                return AcquireAttempt.Failed(ex.Message);
+            }
+        }
+    }
+
+    public static long ReleaseSlice(long bytes)
+    {
+        lock (Gate)
+        {
+            long released = 0;
+            while (released < bytes && Chunks.Count > 0)
+            {
+                Chunk chunk = Chunks[^1];
+                FreeRegion(chunk.Address, chunk.Locked);
+                Chunks.RemoveAt(Chunks.Count - 1);
+                released += chunk.Size;
+            }
+
+            if (Chunks.Count == 0)
+                RestoreWorkingSet();
+            else
+                ApplyWorkingSet(Chunks.Sum(chunk => chunk.Size));
+
+            return released;
         }
     }
 
@@ -150,17 +158,64 @@ internal static class NativeMemory
     {
         lock (Gate)
         {
-            if (_address == IntPtr.Zero)
-            {
-                RestoreWorkingSet();
-                return;
-            }
-
-            FreeRegion(_address, _locked);
-            _address = IntPtr.Zero;
-            _locked = 0;
+            FreeChunks(Chunks);
+            Chunks.Clear();
             RestoreWorkingSet();
         }
+    }
+
+    static Chunk LockSlice(long bytes, uint pageSize, CancellationToken cancellationToken)
+    {
+        long size = AlignUp(bytes, pageSize);
+        IntPtr address = VirtualAlloc(IntPtr.Zero, (UIntPtr)size, MemCommit | MemReserve, PageReadWrite);
+        if (address == IntPtr.Zero)
+            throw new LockFailedException(Win32Message("分配内存失败"));
+
+        long locked = 0;
+        try
+        {
+            TouchPages(address, size, pageSize, cancellationToken);
+            while (locked < size)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (IsShuttingDown)
+                    throw new OperationCanceledException();
+
+                long piece = Math.Min(LockChunk, size - locked);
+                IntPtr pieceAddress = new(address.ToInt64() + locked);
+                if (!VirtualLock(pieceAddress, (UIntPtr)piece))
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    throw new LockFailedException(Win32Message("锁定内存失败", error));
+                }
+
+                locked += piece;
+            }
+
+            return new Chunk(address, size, locked);
+        }
+        catch
+        {
+            FreeRegion(address, locked);
+            throw;
+        }
+    }
+
+    static void FreeChunks(List<Chunk> chunks)
+    {
+        foreach (Chunk chunk in chunks)
+            FreeRegion(chunk.Address, chunk.Locked);
+    }
+
+    static bool ApplyWorkingSet(long lockedBytes)
+    {
+        long minimum = lockedBytes + OverheadBytes;
+        long maximum = minimum + MaxHeadroomBytes;
+        return SetProcessWorkingSetSizeEx(
+            GetCurrentProcess(),
+            (UIntPtr)minimum,
+            (UIntPtr)maximum,
+            QuotaLimitsHardWsMinEnable);
     }
 
     static void FreeRegion(IntPtr address, long locked)
@@ -225,6 +280,27 @@ internal static class NativeMemory
         available = status.AvailPhys;
         total = status.TotalPhys;
         return true;
+    }
+
+    sealed class Chunk
+    {
+        public Chunk(IntPtr address, long size, long locked)
+        {
+            Address = address;
+            Size = size;
+            Locked = locked;
+        }
+
+        public IntPtr Address { get; }
+        public long Size { get; }
+        public long Locked { get; }
+    }
+
+    sealed class LockFailedException : Exception
+    {
+        public LockFailedException(string message) : base(message)
+        {
+        }
     }
 
     static string Win32Message(string action, int? error = null)
